@@ -3,84 +3,57 @@
 #include <stdbool.h>
 #include <string.h>
 
-// Структура с магическими байтами JPG
-struct JPG_TYPE {
-    unsigned char begin[12];
-    short bSize;
-    unsigned char end[2];
-    short eSize;
-};
+// Константы для заголовка/хвоста JPG
+#define HEADER_SIZE 12
+#define FOOTER_SIZE 2
+#define MAX_KEY_SIZE 32
 
-// Инициализация магических байтов JPG
-struct JPG_TYPE jpgType = {
-    .begin = { 0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00 , 0x01 },
-    .end = { 0xFF, 0xD9 },
-    .bSize = 12,
-    .eSize = 2,
+// JPG сигнатуры (начало и конец JFIF-файла)
+const unsigned char JPG_HEADER[HEADER_SIZE] = {
+    0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10,
+    0x4A, 0x46, 0x49, 0x46, 0x00, 0x01
 };
+const unsigned char JPG_FOOTER[FOOTER_SIZE] = { 0xFF, 0xD9 };
 
 // XOR-дешифратор
-void doXor(unsigned char* buffer, long bufferSize, unsigned char* key, short keySize) {
-    for (long i = 0; i < bufferSize; i++) {
+void doXor(unsigned char* buffer, long size, const unsigned char* key, int keySize) {
+    for (long i = 0; i < size; i++) {
         buffer[i] ^= key[i % keySize];
     }
 }
 
+// Проверка начала JPG
+bool checkJpgStart(const unsigned char* buffer) {
+    return memcmp(buffer, JPG_HEADER, HEADER_SIZE) == 0;
+}
+
+// Проверка конца JPG
+bool checkJpgEnd(const unsigned char* buffer, long size) {
+    if (size < FOOTER_SIZE) return false;
+    return memcmp(buffer + size - FOOTER_SIZE, JPG_FOOTER, FOOTER_SIZE) == 0;
+}
+
+// Восстановление ключа по заголовку
+void recoverKeyFromHeader(const unsigned char* buffer, unsigned char* outKey, int keySize) {
+    for (int i = 0; i < keySize; i++) {
+        outKey[i] = buffer[i] ^ JPG_HEADER[i];
+    }
+}
+
 // Печать буфера в hex
-void printBuffer(unsigned char* buffer, int size) {
-    for (int j = 0; j < size; j++) {
-        printf("%02x ", buffer[j]);
+void printHex(const unsigned char* buffer, int size) {
+    for (int i = 0; i < size; i++) {
+        printf("%02X ", buffer[i]);
     }
     printf("\n");
 }
 
-// Копирование буфера (опционально с хвоста)
-void copyBuffer(unsigned char* buffer, int size, unsigned char* destination, int fromTailSize) {
-    if (fromTailSize > 0) {
-        for (int i = size - fromTailSize, j = 0; i < size; i++, j++) {
-            destination[j] = buffer[i];
-        }
-    }
-    else {
-        for (int i = 0; i < size; i++) {
-            destination[i] = buffer[i];
-        }
-    }
-}
-
-// Проверка начала JPG
-bool checkValidStart(unsigned char* startBuffer, int startSize) {
-    if (startSize < jpgType.bSize) {
-        printf("Need %d chars min start to check!\n", jpgType.bSize);
-        abort();
-    }
-    int res = memcmp(startBuffer, jpgType.begin, jpgType.bSize);
-    return res == 0;
-}
-
-// Проверка конца JPG
-bool checkValidEnd(unsigned char* endBuffer, int endSize) {
-    for (int j = 0; j < jpgType.eSize; j++) {
-        if (endBuffer[endSize - jpgType.eSize + j] != jpgType.end[j]) {
-            return false;
-        }
-    }
-    return true;
-}
-
-// Восстановление XOR-ключа по начальному блоку JFIF
-void findStartKeyChars(unsigned char* startBuffer, unsigned char* keyBuffer) {
-    for (int i = 0; i < jpgType.bSize; i++) {
-        keyBuffer[i] = startBuffer[i] ^ jpgType.begin[i];
-    }
-}
-
-// Получить размер файла
-long getFileSize(FILE* f) {
-    fseek(f, 0, SEEK_END);
-    long s = ftell(f);
-    rewind(f);
-    return s;
+// Получение размера файла
+long getFileSize(FILE* file) {
+    fseek(file, 0, SEEK_END);
+    long size = ftell(file);
+    rewind(file);
+    return size;
 }
 
 int main(int argc, char* argv[]) {
@@ -89,76 +62,65 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    printf("Decrypting file: %s\n", argv[1]);
+    const char* inputFile = argv[1];
+    const char* outputFile = "res.jpg";
 
-    // Чтение файла
-    FILE* file = fopen(argv[1], "rb");
-    if (!file) {
+    FILE* f = fopen(inputFile, "rb");
+    if (!f) {
         perror("Error opening file");
         return 1;
     }
 
-    long fileSize = getFileSize(file);
+    long fileSize = getFileSize(f);
     printf("File size: %ld bytes\n", fileSize);
 
-    unsigned char* buffer = malloc(fileSize);
-    if (!buffer) {
+    unsigned char* encrypted = (unsigned char*)malloc(fileSize);
+    unsigned char* decrypted = (unsigned char*)malloc(fileSize);
+    if (!encrypted || !decrypted) {
         perror("Memory allocation failed");
-        fclose(file);
+        fclose(f);
+        free(encrypted);
+        free(decrypted);
         return 1;
     }
 
-    fread(buffer, 1, fileSize, file);
-    fclose(file);
+    fread(encrypted, 1, fileSize, f);
+    fclose(f);
 
-    unsigned char* tempBuffer = malloc(fileSize);
-    if (!tempBuffer) {
-        perror("Memory allocation failed");
-        free(buffer);
-        return 1;
-    }
+    bool success = false;
+    unsigned char key[32] = { 0 };
 
-    unsigned char startPart[14];
-    unsigned char key[14] = { 0 };
+    // Перебор возможной длины ключа
+    for (int keyLen = 1; keyLen <= MAX_KEY_SIZE && !success; keyLen++) {
+        recoverKeyFromHeader(encrypted, key, keyLen);
 
-    findStartKeyChars(buffer, key);
+        memcpy(decrypted, encrypted, fileSize);
+        doXor(decrypted, fileSize, key, keyLen);
 
-    printf("Initial key guess:\n");
-    printBuffer(key, 12);
+        if (checkJpgStart(decrypted) && checkJpgEnd(decrypted, fileSize)) {
+            printf("Decryption successful!\n");
+            printf("Key length: %d\nKey: ", keyLen);
+            printHex(key, keyLen);
 
-    bool isValid = false;
-    for (int a = 0; a <= 0xFF && !isValid; a++) {
-        key[13] = a;
-        for (int b = 0; b <= 0xFF && !isValid; b++) {
-            key[12] = b;
-            for (int k = 12; k <= 14 && !isValid; k++) {
-                copyBuffer(buffer, 14, startPart, 0);
-                doXor(startPart, 14, key, k);
-
-                if (checkValidStart(startPart, 14)) {
-                    memcpy(tempBuffer, buffer, fileSize);
-                    doXor(tempBuffer, fileSize, key, k);
-
-                    isValid = checkValidEnd(tempBuffer, fileSize);
-                    if (isValid) {
-                        printf("Decryption successful with key length: %d\n", k);
-                        printf("Final key:\n");
-                        printBuffer(key, k);
-                        
-                        FILE* res = fopen("res.jpg", "wb");
-                        fwrite(tempBuffer, sizeof(char), fileSize, res);
-                        fclose(res);
-                    }
-                }
+            FILE* out = fopen(outputFile, "wb");
+            if (!out) {
+                perror("Failed to write output file");
             }
+            else {
+                fwrite(decrypted, 1, fileSize, out);
+                fclose(out);
+                printf("Decrypted file saved to %s\n", outputFile);
+            }
+
+            success = true;
         }
     }
 
-    if (!isValid) {
-        printf("Failed to find valid key.\n");
+    if (!success) {
+        printf("Failed to find valid key or decrypt JPEG.\n");
     }
 
-    free(tempBuffer);
-    free(buffer);
+    free(encrypted);
+    free(decrypted);
     return 0;
 }
